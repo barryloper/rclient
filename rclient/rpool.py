@@ -3,59 +3,35 @@ RServe Connection Pool
 Based on RConnectionPool
 http://icbtools.med.cornell.edu/javadocs/RUtils/edu/cornell/med/icb/R/RConnectionPool.html
 
-This module creates and manages a pool of connections to an RServe process. It uses the idea that Python modules are
-are only imported once, sys.modules registry is thread safe, and a module can maintain state to maintain a context
-for a persistent pool of RServe connections.
+# Usage:
 
-fixme: or should i use a factory function to return a connection instance?
-
-todo:
-make sure each connection gets cleaned up
-allow users to specify number of connections
-
-python has built-in queue modules i can use
-need to start with N processes in a queue. when one finishes, clean up, then add to back of queue
-If the queue is full, add more processes (this could be an interesting optimization target. how fast to add processes to keep up with demand)
-Clean up idle processes in excess of N if they've been idle for "some time"
-Actually, how bout an idle target config? When number of idle processes gets below target, start some more in a non-blocking way
-
-
-
-since connections will be reused, the idea of saving uploaded files doesn't work. If we want to do this later, the cleanup
-should move files to some archive location.
-
-not using asynchio.queue, since we aren't sending commands to subscribers
-
-rserve is already started. we are pooling connections. Each new connection, rserve will start another R process
-
-usage:
-import rpool # initializes the pool with config if first import
-
-with rpool.connect() as conn:
-    conn.upload('myModel.zip')
-    conn.eval('''some R code''')
-
-"""
-
-import logging
-from .rservecontext import RContext
-
-logger = logging.getLogger(__name__)
-
-# fixme: don't allow adding processes to pool to block the tornado loop
-# actually, i/o blocking might not be a problem since we're in a thread
-
-#don't want to just make a pool of python processes, but want do do something similar.
-#the pool will be of rserve connections
-
-"""
 rpool = Pool(
-    connections=10,
-    initargs={'save_files': False},
-    maxtasksperchild=None
+    pool_size = 10,
+    realtime = False
 )
 
+result = rpool.eval('''some r code''')
+
+# Interactive usage:
+
+c = rpool.connect()
+r1 = c.eval('''some r code''')
+r2 = c.eval('''some other r code''')
+c.close()
+
+# Context usage:
+
+with rpool.connect() as c:
+    r1 = c.eval('''some r code''')
+    r2 = c.eval('''some other r code''')
+
 todo:
+
+upload a shared model bundle that all pool processes have access to
+Perhaps as interpreters boot up, they source some file(s) in the bundle? For the purpose of loading functions.
+Problem would arise if sourcing the files runs the model.
+
+clean up temp folders
 
 possible other methods to implement: map, map_async, star_map
 
@@ -65,30 +41,57 @@ a model may be evaluated.
 what if we can add a model bundle to the pool, so that each connection has access to a set of files.
 don't want each connection to be able to write to the model bundle. Each connection gets their own copy of the bundle.
 
-would be nice to have each connection context-managed, so its __exit__ would be called when necessary
-
 handle if we lose connection for some reason. pyRserve has a decorator
+
+fixme: don't allow adding processes to pool to block the tornado loop
+actually, i/o blocking might not be a problem since we're in a thread
+
+don't want to just make a pool of python processes, but want do do something similar.
+the pool will be of rserve connections
 
 """
 
+import logging
+from functools import wraps
 
-class OutOfResources(BaseException):
-    pass
+import pyRserve
+
+__all__ = ['RPool']
+
+logger = logging.getLogger(__name__)
+
+RSERVEPORT = pyRserve.rconn.RSERVEPORT
+
+_defaultOOBCallback = pyRserve.rconn._defaultOOBCallback
 
 
 class PoolEmpty(KeyError):
     pass
 
 
-class OverflowNotAvailable(BaseException):
+class DisconnectedError(BaseException):
     pass
+
+
+class MethodNotAllowed(BaseException):
+    pass
+
+
+def if_pool_is_not_full(wrapped_method):
+    @wraps(wrapped_method)
+    def wrapper(self, *args, **kw):
+        if len(self.pool) < self._pool_size:
+            return wrapped_method(self, *args, **kw)
+
+    return wrapper
 
 
 class RPool(object):
 
-    def __init__(self, constructor, *cargs, pool_size=1, max_overflow=-1, realtime=False, save_files=True, **ckwargs):
+    def __init__(self, pool_size=1, realtime=False, *cargs, **ckwargs):
         """
-        todo: :param min_sleeping: attempt to keep a minimum buffer of N connections ready for
+        todo: :param model_dir: read-only location where uploads are stored
+        todo: in lieu of save_files=False, have a periodic cleanup routine
 
         fixme: wouldn't it make sense for each model to have its own pool and model directory?
                then, RServe's tmp directory would truly be isolated tmp.
@@ -97,103 +100,195 @@ class RPool(object):
                Such code should be minimal, as it is going to cause latency in getting a pool up, and for overflow connections.
                We don't need to evaluate multiple expressions, just some 'main' entrypoint to their model.
 
-        :param constructor: function/class that will return a connection
+        todo: :param constructor: function/class that will return a connection
         :param cargs: args passed to constructor: constructor(*cargs, **ckwargs)
         :param ckwargs: see cargs
-        :param pool_size: minimum number of connections
-        :param max_overflow: maximum additional connections to allow once the pool_size is exhausted
+        :param pool_size: minimum number of connections. This is the initial size of the pool
         :param realtime: realtime pools will not close connections before returning to pool
-        :param save_files: passed to constructor
 
-        Other args and kwargs passed to constructor
         """
-        if not issubclass(constructor, RContext):
-            raise TypeError("constructor must be a subclass of RContext")
-        else:
-            self._constructor = constructor
-            self._cargs = cargs
-            self._ckwargs = ckwargs
+
+        self._cargs = cargs
+        self._ckwargs = ckwargs
 
         self._pool_size = pool_size
-        self._overflow_used = 0
-        self._max_overflow = max_overflow
         self._realtime = realtime
-        self._save_files = save_files
 
-        self._pool = []
-        self._checked_out = []
-        self._repopulate_pool()
+        self._init_pool()
 
-    def connect(self):
-        """ Return a connection from the pool, and note connection as checked out
-            fixme: what happens when we connect, but don't assign it to a reference that we can close later??
-              if the refcount of something that is in checked_out == 1, check it back in?
+    def __del__(self):
+        try:
+            self._close_all()
+        except pyRserve.rexceptions.PyRserveClosed:
+            pass
 
-            disconnect is called from the checked out item
+    def eval(self, expression):
+        """ checkout a connection, execute an expression, then close the connection
+            connection will check itself back in
+        """
+        c = self._checkout()
+        retval = c.eval(expression)
+        c.close()
+        return retval
 
+    def _init_pool(self):
+        # todo: can we parallelize this?
+        self.pool = [self._new_connection() for _ in range(self._pool_size)]
+
+    def _new_connection(self):
+        """ creates the connections for storage in the pool.
+            don't use this for interactive connections
+        """
+        return _PooledPyRserve(*self._cargs, **self._ckwargs)
+
+    def _close_all(self):
+        """ clean up each connection """
+        for c in self.pool:
+            logger.debug("closing ", id(c))
+            c.close()
+
+    def _checkout(self):
+        """ pulls a connection from the pool, or creates a new one.
+            returns an wrapper for the connection which knows how to check itself back in
         """
         try:
-            c = self._checkout()
-        except PoolEmpty:
-            logger.debug("""Pool of {} empty. Creating overflow {} of {}.""".format(self._pool_size,
-                len(self._checked_out) - self._pool_size, self._max_overflow))
-            c = self._try_overflow()
+            c = self.pool.pop()
+        except IndexError:
+            c = self._new_connection()
+        return _PooledConnectionInteractor(pool=self, connection=c)
 
-        return c
+    connect = _checkout
 
-    def close(self, c): # how does the client call this?
-        # pool.close() is that's right?
-        """Return a checked-out connection to the pool. Restart it if realtime is False"""
+    @if_pool_is_not_full
+    def _checkin(self, c):
+        """ Returns the connection to the pool
+            If pool is full, allow the connection to be garbage collected. (do nothing)
+            If we aren't real-time, reset the connection.
+
+        """
+
         if self._realtime is False:
-            c.close()
-            self._repopulate_pool()
-        else:
-            self._checkin(c)
+            c.reset()
+
+        self.pool.append(c)
+
+    checkin = _checkin
 
     def terminate(self, c):
         """kill a connection harshly"""
         raise NotImplementedError
 
-    def _overflow(self):
-        """Create and check out an overflow connection if """
-        if self._resources_are_available():
-            c = self._make_connection()
-            self._checkout(c)
-            return c
-        else:
-            # fixme: can do this better. maybe a timeout
-            raise OutOfResources("No more connections currently available. Try again later.")
+    def upload(self, archive):
+        raise NotImplementedError
 
-    def _checkout(self):
-        """ used by self.connect() to mark a connection checked out """
+
+def only_if_open(wrapped_method):
+    """ method decorator that only runs the decorated function if the connection is open
+    """
+
+    @wraps(wrapped_method)
+    def wrapper(self, *args, **kw):
+        if self.connection is not None:
+            return wrapped_method(self, *args, **kw)
+
+    return wrapper
+
+
+class _PooledConnectionInteractor(object):
+    """ A wrapper for Rserve connection that you've taken out of the pool.
+
+        knows what pool it came from and how to check itself back in.
+
+        todo: look at out-of-bounds messages https://pythonhosted.org/pyRserve/manual.html#out-of-bounds-messages-oob
+    """
+
+    def __init__(self, pool, connection):
+        """"""
+        self._pool = pool
+        self._connection = connection
+
+    def __del__(self):
         try:
-            c = self._pool.pop()
-        except KeyError:
-            raise PoolEmpty("No available connections in pool")
-        else:
-            self._checked_out.append(c)
-            return c
+            self.close()
+        except pyRserve.rexceptions.PyRserveClosed:
+            pass
 
-    def checkin(self, c): # sqlalchemy puts these methods on the connection proxy object.
-        """ usesd by RContext.close() to check the connection back into the pool """
-        if self._realtime is False:
-            c.reconnect()
+    @only_if_open
+    def __getattr__(self, item):
+        return getattr(self.connection, item)
 
-        self._checked_out.remove(c)
-        self._pool.append(c)
+    def __enter__(self):
+        return self
 
-    def _make_connection(self):
-        return self._constructor(pool=self, save_files=self._save_files, *self._cargs, **self._ckwargs)
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
 
-    def _repopulate_pool(self):
-        while len(self._pool) < self._pool_size:
-            self._pool.append(self._make_connection())
-            #todo: can _pool be something that has context management?
-            #todo: can this be done async?
+    @property
+    def connection(self):
+        return self._connection
 
-    def _resources_are_available(self):
-        if self._max_overflow > -1:
-            return len(self._checked_out) < self._pool_size + self._max_overflow
-        else:
-            return len(self._checked_out) < self._pool_size
+    @property
+    def pool(self):
+        return self._pool
+
+    @only_if_open
+    def _checkin(self):
+        """ check our connection back into the pool """
+        try:
+            self.pool.checkin(self.connection)
+        except AttributeError:
+            """pool is probably already None"""
+            pass
+
+        self._pool = None
+
+    @only_if_open
+    def close(self):
+        """ return our connection to the pool, and remove our reference to it """
+        self._checkin()
+        self._connection = None
+
+    @staticmethod
+    def shutdown():
+        """ don't allow shutting down of rserve
+            self.connection.shutdown may still be used, but it's not recommended
+        """
+        raise MethodNotAllowed('''Please don't shut down the RServe from here''')
+
+
+class _PooledPyRserve(pyRserve.rconn.RConnector):
+    """ extends pyRserve's RConnector with default arguments
+
+        prevents shutting down the R server from an individual connection
+
+        adds the ability to reset the connection, starting a new R interpreter
+    """
+
+    def __init__(self, host='', port=RSERVEPORT, atomicArray=False, defaultVoid=False,
+                 oobCallback=_defaultOOBCallback):
+        super().__init__(host, port, atomicArray, defaultVoid, oobCallback)
+
+    def __del__(self):
+        """ prevent stale RServe handles, since the parent class doesn't do this. """
+        try:
+            self.close()
+        except pyRserve.rexceptions.PyRserveClosed:
+            pass
+
+    @property
+    def wd(self):
+        return self.r.getwd()
+
+    def reset(self):
+        """ make a new connection
+        """
+        self.close()
+        self.connect()
+
+    def shutdown(self):
+        """" don't want a connection shutting down the r server. """
+        raise MethodNotAllowed('''Shutting down the R server is not allowed from pooled connections.''')
+
+
+
 

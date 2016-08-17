@@ -72,7 +72,7 @@ class RContext(object):
         """ return to pool when refcount -> 0
             problem with this is that it will have a ref in pool.checked_out
         """
-        self.disconnect()
+        self.close()
 
     def __getattr__(self, item):
         """ Any undefined attributes will be proxied to the pyRserve connection
