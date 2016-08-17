@@ -86,7 +86,7 @@ def if_pool_is_not_full(wrapped_method):
     return wrapper
 
 
-class RPool(object):
+class RServeConnection(object):
 
     def __init__(self, pool_size=1, realtime=False, *cargs, **ckwargs):
         """
