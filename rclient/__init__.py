@@ -1,7 +1,8 @@
 
-from . import rpool, rservecontext
+from . import connector, rservecontext
 
-RServeConnection = rpool.RServeConnection
+RServeConnection = connector.RServeConnection
 RContext = rservecontext.RContext
 
-RPool = rpool.RServeConnection  # for backwards compatibility
+RPool = connector.RServeConnection  # for backwards compatibility
+rpool = connector

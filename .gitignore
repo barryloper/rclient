@@ -1,3 +1,7 @@
 __pycache__
 *.pyc
 ~*
+.cache
+.idea
+.ipynb_checkpoints
+*.swp

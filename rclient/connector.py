@@ -56,7 +56,7 @@ from functools import wraps
 
 import pyRserve
 
-__all__ = ['RPool']
+__all__ = ['RServeConnection']
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +113,7 @@ class RServeConnection(object):
 
         self._pool_size = pool_size
         self._realtime = realtime
-
+        self.pool = None
         self._init_pool()
 
     def __del__(self):
@@ -143,9 +143,10 @@ class RServeConnection(object):
 
     def _close_all(self):
         """ clean up each connection """
-        for c in self.pool:
-            logger.debug("closing ", id(c))
-            c.close()
+        if self.pool is not None:
+            for c in self.pool:
+                logger.debug("closing ", id(c))
+                c.close()
 
     def _checkout(self):
         """ pulls a connection from the pool, or creates a new one.
@@ -180,6 +181,8 @@ class RServeConnection(object):
 
     def upload(self, archive):
         raise NotImplementedError
+
+RPool = RServeConnection  # For backwards-compatibitily
 
 
 def only_if_open(wrapped_method):
