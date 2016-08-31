@@ -22,7 +22,7 @@ conf = {
 }
 
 
-class RContext(object):
+class RContext:
     """ RContext with localhost connection and local file storage.
         A proxy for the pyRserve connection object which is documented at:
             https://pythonhosted.org/pyRserve/manual.html
